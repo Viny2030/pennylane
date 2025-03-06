@@ -200,6 +200,14 @@ def _(*args, qnode, shots, device, execution_config, qfunc_jaxpr, n_consts, batc
     consts = args[:n_consts]
     non_const_args = args[n_consts:]
 
+    @qml.capture.expand_plxpr_transforms
+    def wrapper(*inner_args):
+        return qml.capture.PlxprInterpreter().eval(qfunc_jaxpr, consts, *inner_args)
+
+    qfunc_jaxpr = jax.make_jaxpr(wrapper)(*non_const_args)
+    consts = qfunc_jaxpr.consts
+    qfunc_jaxpr = qfunc_jaxpr.jaxpr
+
     partial_eval = partial(
         device.eval_jaxpr, qfunc_jaxpr, consts, execution_config=execution_config
     )
@@ -508,6 +516,7 @@ def capture_qnode(qnode: "qml.QNode", *args, **kwargs) -> "qml.typing.Result":
             qfunc_jaxpr = jax.make_jaxpr(
                 flat_fn, abstracted_axes=abstracted_axes, static_argnums=qnode.static_argnums
             )(*args)
+
         except (
             jax.errors.TracerArrayConversionError,
             jax.errors.TracerIntegerConversionError,

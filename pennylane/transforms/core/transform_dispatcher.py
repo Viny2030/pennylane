@@ -29,7 +29,7 @@ class TransformError(Exception):
     """Raised when there is an error with the transform logic."""
 
 
-def register_primitive_for_expansion(primitive, plxpr_transform):
+def register_primitive_for_expansion(primitive):  # , plxpr_transform):
     """Register a transform such that it can be expanded when applied to a function with
     program capture enabled."""
     # pylint: disable=import-outside-toplevel
@@ -42,7 +42,7 @@ def register_primitive_for_expansion(primitive, plxpr_transform):
 
     @ExpandTransformsInterpreter.register_primitive(primitive)
     def _(
-        self, *invals, inner_jaxpr, args_slice, consts_slice, targs_slice, tkwargs
+        self, *invals, inner_jaxpr, args_slice, consts_slice, targs_slice, tkwargs, plxpr_transform
     ):  # pylint: disable=too-many-arguments,missing-docstring
         if plxpr_transform is None:
             raise NotImplementedError
@@ -118,7 +118,7 @@ class TransformDispatcher:  # pylint: disable=too-many-instance-attributes
 
         self._plxpr_transform = plxpr_transform
         self._primitive = _create_transform_primitive(self._transform.__name__)
-        register_primitive_for_expansion(self._primitive, self._plxpr_transform)
+        register_primitive_for_expansion(self._primitive)  # , self._plxpr_transform)
 
     def __call__(
         self, *targs, **tkwargs
@@ -158,7 +158,8 @@ class TransformDispatcher:  # pylint: disable=too-many-instance-attributes
 
         if isinstance(obj, qml.QNode):
             if qml.capture.enabled():
-                return self._capture_callable_transform(obj, targs, tkwargs)
+                qnode = self.default_qnode_transform(obj, targs, tkwargs)
+                return self._capture_callable_transform(qnode, targs, tkwargs)
             return self._qnode_transform(obj, targs, tkwargs)
 
         if isinstance(obj, qml.devices.Device):
@@ -311,6 +312,7 @@ class TransformDispatcher:  # pylint: disable=too-many-instance-attributes
                 consts_slice=consts_slice,
                 targs_slice=targs_slice,
                 tkwargs=tkwargs,
+                plxpr_transform=self.plxpr_transform,
             )
 
             assert flat_qfunc.out_tree is not None
@@ -550,9 +552,25 @@ def _create_transform_primitive(name):
 
     @transform_prim.def_impl
     def _(
-        *all_args, inner_jaxpr, args_slice, consts_slice, targs_slice, tkwargs
+        *all_args, inner_jaxpr, args_slice, consts_slice, targs_slice, tkwargs, plxpr_transform
     ):  # pylint: disable=unused-argument
-        raise NotImplementedError
+        import jax
+
+        targs = all_args[targs_slice]
+        args = all_args[args_slice]
+        consts = all_args[consts_slice]
+
+        @qml.capture.expand_plxpr_transforms
+        def wrapper(*inner_args):
+            return qml.capture.PlxprInterpreter().eval(inner_jaxpr, consts, *inner_args)
+
+        first_jaxpr = jax.make_jaxpr(wrapper)(*args)
+        transformed_jaxpr = plxpr_transform(
+            first_jaxpr.jaxpr, first_jaxpr.consts, targs, tkwargs, *args
+        )
+        return qml.capture.PlxprInterpreter().eval(
+            transformed_jaxpr.jaxpr, transformed_jaxpr.consts, *args
+        )
 
     @transform_prim.def_abstract_eval
     def _(*_, inner_jaxpr, **__):
