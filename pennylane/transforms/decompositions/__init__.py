@@ -13,4 +13,4 @@
 # limitations under the License.
 r"""This module contains decompositions for quantum circuits."""
 
-from .clifford_t_transform import clifford_t_decomposition
+from .clifford_t_transform import clifford_t_decomposition, clifford_t_decomposition_default

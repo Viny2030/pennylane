@@ -127,6 +127,7 @@ from pennylane.transforms import (
     pattern_matching,
     pattern_matching_optimization,
     clifford_t_decomposition,
+    clifford_t_decomposition_default,
     add_noise,
 )
 from pennylane.ops.functions import (

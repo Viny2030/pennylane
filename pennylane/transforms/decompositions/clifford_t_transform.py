@@ -17,6 +17,7 @@ import math
 import warnings
 from functools import lru_cache, partial
 from itertools import product
+import cProfile
 
 from tqdm import tqdm
 
@@ -384,6 +385,7 @@ def clifford_t_decomposition(
     tape: QuantumScript,
     epsilon=1e-4,
     method="sk",
+    prof_path=None,
     **method_kwargs,
 ) -> tuple[QuantumScriptBatch, PostprocessingFn]:
     r"""Decomposes a circuit into the Clifford+T basis.
@@ -503,6 +505,8 @@ def clifford_t_decomposition(
         # def decompose_fn(op: Operator, epsilon: float, **method_kwargs) -> List[Operator]
         # note: the last operator in the decomposition must be a GlobalPhase
 
+        profiler = cProfile.Profile()
+        profiler.enable()
         # Build the decomposition cache based on the method
         global _CLIFFORD_T_CACHE  # pylint: disable=global-statement
         if _CLIFFORD_T_CACHE is None or _CLIFFORD_T_CACHE.equal(method, epsilon, **method_kwargs):
@@ -521,6 +525,9 @@ def clifford_t_decomposition(
                 decomp_ops.extend(getattr(mapped_ops, "operands", [mapped_ops]))
             else:
                 decomp_ops.append(op)
+                
+        profiler.disable()
+        profiler.dump_stats(prof_path)
 
         # check if phase is non-zero for non jax-jit cases
         if qml.math.is_abstract(phase) or not qml.math.allclose(phase, 0.0):
@@ -530,8 +537,178 @@ def clifford_t_decomposition(
     new_tape = compiled_tape.copy(operations=decomp_ops)
 
     # Perform a final attempt of simplification before return
-    [new_tape], _ = cancel_inverses(new_tape)
+    # [new_tape], _ = cancel_inverses(new_tape)
 
+    def null_postprocessing(results):
+        """A postprocesing function returned by a transform that only converts the batch of results
+        into a result for a single ``QuantumTape``.
+        """
+        return results[0]
+
+    return [new_tape], null_postprocessing
+
+
+# pylint: disable=too-many-branches
+@transform
+def clifford_t_decomposition_default(
+    tape: QuantumScript,
+    epsilon=1e-4,
+    method="sk",
+    prof_path=None,
+    **method_kwargs,
+) -> tuple[QuantumScriptBatch, PostprocessingFn]:
+    r"""Decomposes a circuit into the Clifford+T basis.
+
+    This method first decomposes the gate operations to a basis comprised of Clifford, :class:`~.T`, :class:`~.RZ` and
+    :class:`~.GlobalPhase` operations (and their adjoints). The Clifford gates include the following PennyLane operations:
+
+    - Single qubit gates - :class:`~.Identity`, :class:`~.PauliX`, :class:`~.PauliY`, :class:`~.PauliZ`,
+      :class:`~.SX`, :class:`~.S`, and :class:`~.Hadamard`.
+    - Two qubit gates - :class:`~.CNOT`, :class:`~.CY`, :class:`~.CZ`, :class:`~.SWAP`, and :class:`~.ISWAP`.
+
+    Then, the leftover single qubit :class:`~.RZ` operations are approximated in the Clifford+T basis with
+    :math:`\epsilon > 0` error. By default, we use the Solovay-Kitaev algorithm described in
+    `Dawson and Nielsen (2005) <https://arxiv.org/abs/quant-ph/0505030>`_ for this.
+
+    Args:
+        tape (QNode or QuantumTape or Callable): The quantum circuit to be decomposed.
+        epsilon (float): The maximum permissible operator norm error of the complete circuit decomposition. Defaults to ``0.0001``.
+        method (str): Method to be used for Clifford+T decomposition. Default value is ``"sk"`` for Solovay-Kitaev.
+        **method_kwargs: Keyword argument to pass options for the ``method`` used for decompositions.
+
+    Returns:
+        qnode (QNode) or quantum function (Callable) or tuple[List[QuantumTape], function]: The transformed circuit as described
+        in the :func:`qml.transform <pennylane.transform>`.
+
+    **Keyword Arguments**
+
+    - Solovay-Kitaev decomposition --
+        **max_depth** (int), **basis_set** (list[str]), **basis_length** (int) -- arguments for the ``"sk"`` method,
+        where the decomposition is performed using the :func:`~.sk_decomposition` method.
+
+    Raises:
+        ValueError: If a gate operation does not have a decomposition when required.
+        NotImplementedError: If chosen decomposition ``method`` is not supported.
+
+    .. seealso:: :func:`~.sk_decomposition` for Solovay-Kitaev decomposition.
+
+    **Example**
+
+    .. code-block:: python3
+
+        @qml.qnode(qml.device("default.qubit"))
+        def circuit(x, y):
+            qml.RX(x, 0)
+            qml.CNOT([0, 1])
+            qml.RY(y, 0)
+            return qml.expval(qml.Z(0))
+
+        x, y = 1.1, 2.2
+        decomposed_circuit = qml.transforms.clifford_t_decomposition(circuit)
+        result = circuit(x, y)
+        approx = decomposed_circuit(x, y)
+
+    >>> qml.math.allclose(result, approx, atol=1e-4)
+    True
+    """
+
+    with QueuingManager.stop_recording():
+        # Build the basis set and the pipeline for initial compilation pass
+        basis_set = [op.__name__ for op in _PARAMETER_GATES + _CLIFFORD_T_GATES + _SKIP_OP_TYPES]
+        pipelines = [remove_barrier, commute_controlled, cancel_inverses, merge_rotations]
+
+        # Compile the tape according to depth provided by the user and expand it
+        [compiled_tape], _ = qml.compile(tape, pipelines, basis_set=basis_set)
+
+        # Now iterate over the expanded tape operations
+        decomp_ops, gphase_ops = [], []
+        for op in compiled_tape.operations:
+            # Check whether operation is to be skipped
+            if isinstance(op, _SKIP_OP_TYPES):
+                decomp_ops.append(op)
+
+            # Check whether the operation is a global phase
+            elif isinstance(op, qml.GlobalPhase):
+                gphase_ops.append(op)
+
+            # Check whether the operation is a Clifford or a T-gate
+            elif op.name in basis_set and check_clifford_t(op):
+                if op.num_params:
+                    decomp_ops.extend(_rot_decompose(op))
+                else:
+                    decomp_ops.append(op)
+
+            # Decompose and then iteratively go deeper via DFS
+            else:
+                # Single qubit unitary decomposition with ZXZ rotations
+                if op.num_wires == 1:
+                    if op.name in basis_set:
+                        d_ops = _rot_decompose(op)
+                    else:
+                        d_ops, g_op = _one_qubit_decompose(op)
+                        gphase_ops.append(g_op)
+                    decomp_ops.extend(d_ops)
+
+                # Two qubit unitary decomposition with SU(4) rotations
+                elif op.num_wires == 2:
+                    d_ops = _two_qubit_decompose(op)
+                    decomp_ops.extend(d_ops)
+
+                # If we don't know how to decompose the operation
+                else:
+                    raise ValueError(
+                        f"Cannot unroll {op} into the Clifford+T basis as no rule exists for its decomposition"
+                    )
+
+        # Merge RZ rotations together
+        merged_ops, number_ops = _merge_param_gates(decomp_ops, merge_ops=["RZ"])
+
+        # Squeeze global phases into a single global phase
+        new_operations = _fuse_global_phases(merged_ops + gphase_ops)
+
+        # Compute the per-gate epsilon value
+        epsilon /= number_ops or 1
+
+        # Every decomposition implementation should have the following shape:
+        # def decompose_fn(op: Operator, epsilon: float, **method_kwargs) -> List[Operator]
+        # note: the last operator in the decomposition must be a GlobalPhase
+
+        # Build the approximation set for Solovay-Kitaev decomposition
+        if method == "sk":
+            decompose_fn = sk_decomposition
+
+        else:
+            raise NotImplementedError(
+                f"Currently we only support Solovay-Kitaev ('sk') decomposition, got {method}"
+            )
+
+        profiler = cProfile.Profile()
+        profiler.enable()
+        
+        decomp_ops = []
+        phase = new_operations.pop().data[0]
+        for op in new_operations:
+            if isinstance(op, qml.RZ):
+                clifford_ops = decompose_fn(op, epsilon, **method_kwargs)
+                phase += qml.math.convert_like(clifford_ops.pop().data[0], phase)
+                decomp_ops.extend(clifford_ops)
+            else:
+                decomp_ops.append(op)
+
+        profiler.disable()
+        profiler.dump_stats(prof_path)
+
+        # check if phase is non-zero for non jax-jit cases
+        if qml.math.is_abstract(phase) or not qml.math.allclose(phase, 0.0):
+            decomp_ops.append(qml.GlobalPhase(phase))
+
+    # Construct a new tape with the expanded set of operations
+    new_tape = compiled_tape.copy(operations=decomp_ops)
+
+    # Perform a final attempt of simplification before return
+    # [new_tape], _ = cancel_inverses(new_tape)
+    
+    
     def null_postprocessing(results):
         """A postprocesing function returned by a transform that only converts the batch of results
         into a result for a single ``QuantumTape``.

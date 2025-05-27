@@ -298,7 +298,7 @@ from .convert_to_numpy_parameters import convert_to_numpy_parameters
 from .compile import compile
 from .add_noise import add_noise
 
-from .decompositions import clifford_t_decomposition
+from .decompositions import clifford_t_decomposition, clifford_t_decomposition_default
 from .defer_measurements import defer_measurements
 from .diagonalize_measurements import diagonalize_measurements
 from .dynamic_one_shot import dynamic_one_shot, is_mcm
